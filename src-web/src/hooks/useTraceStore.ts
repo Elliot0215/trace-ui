@@ -1,6 +1,6 @@
 import { useState, useCallback, useRef, useEffect } from "react";
 import { invoke } from "@tauri-apps/api/core";
-import { listen } from "@tauri-apps/api/event";
+import { emit, listen } from "@tauri-apps/api/event";
 import type { CreateSessionResult, SessionData, SearchResult } from "../types/trace";
 import { useLineCache } from "./useLineCache";
 import { selectedSeqStore } from "../stores/selectedSeqStore";
@@ -246,7 +246,12 @@ export function useTraceStore(skipStrings: boolean = false) {
     });
     selectedSeqMapRef.current.delete(sessionId);
     removeSessionCache(sessionId);
-  }, [removeSessionCache]);
+    clearSearchState();
+    navigationStore.reset();
+    selectedSeqStore.set(null);
+    // 通知浮窗清空搜索状态
+    emit("sync:search-state", { matchSeqs: [], query: "", status: "", totalMatches: 0 });
+  }, [removeSessionCache, clearSearchState]);
 
   const closeSession = useCallback(async (sessionId: string) => {
     await removeSessionAndSelectNext(sessionId);
@@ -256,23 +261,21 @@ export function useTraceStore(skipStrings: boolean = false) {
     const sid = activeSessionIdRef.current;
     if (!sid) return;
     await removeSessionAndSelectNext(sid);
-    clearSearchState();
     setSavedScrollSeq(null);
     setIsLoading(false);
     setLoadingMessage("");
-  }, [removeSessionAndSelectNext, clearSearchState]);
+  }, [removeSessionAndSelectNext]);
 
   const cancelLoading = useCallback(async () => {
     const sid = activeSessionIdRef.current;
     if (!sid) return;
     // 关闭正在加载的 session，后端 build_index 线程写入结果时会发现 session 已删除
     await removeSessionAndSelectNext(sid);
-    clearSearchState();
     setSavedScrollSeq(null);
     setIsLoading(false);
     setLoadingMessage("");
     isRebuildingRef.current = false;
-  }, [removeSessionAndSelectNext, clearSearchState]);
+  }, [removeSessionAndSelectNext]);
 
   const switchSession = useCallback((id: string) => {
     setActiveSessionId(id);
@@ -281,6 +284,8 @@ export function useTraceStore(skipStrings: boolean = false) {
     const seq = selectedSeqMapRef.current.get(id) ?? null;
     selectedSeqStore.set(seq);
     setSavedScrollSeq(seq);
+    // 通知浮窗清空搜索状态
+    emit("sync:search-state", { matchSeqs: [], query: "", status: "", totalMatches: 0 });
   }, [clearSearchState]);
 
   const rebuildIndex = useCallback(async () => {
