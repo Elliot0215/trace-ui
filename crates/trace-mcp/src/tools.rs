@@ -455,47 +455,54 @@ impl TraceToolHandler {
 
     #[tool(
         name = "get_tainted_lines",
-        description = "Retrieve the instructions marked as tainted by the last run_taint_analysis. \
+        description = "Retrieve the instructions marked as tainted by the last run_taint_analysis or taint_analysis. \
             Returns full line content with disassembly for each tainted instruction. \
             Supports pagination with offset/limit. \
-            By default, filters out lines that only modify stack/frame pointer registers."
+            By default, filters out lines that only modify stack/frame pointer registers. \
+            Supports addr_range filter and context_lines to show surrounding non-tainted lines."
     )]
     fn get_tainted_lines(&self, Parameters(req): Parameters<GetTaintedLinesRequest>) -> Result<String, String> {
         let sid = self.resolve_session(req.session_id)?;
         let limit = req.limit.min(200);
+        let ctx_lines = req.context_lines.min(5);
 
         let all_seqs = self.engine.get_tainted_seqs(&sid)
             .map_err(|e| e.to_string())?;
 
         let total_tainted = all_seqs.len() as u32;
 
-        // 栈操作过滤 + 分页
-        let (lines, total_after_filter, stack_ops_filtered) = if req.ignore_stack_ops && !all_seqs.is_empty() {
-            // 需要加载全部污点行以判断 is_stack_only_change
+        // 栈操作过滤
+        let (after_stack_filter, stack_ops_filtered) = if req.ignore_stack_ops && !all_seqs.is_empty() {
             let all_lines = self.engine.get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
-            // 先过滤，再分页，复用已加载的行数据
             let kept: Vec<TraceLine> = all_lines.into_iter()
                 .filter(|line| !is_stack_only_change(&line.changes))
                 .collect();
             let filtered_count = total_tainted - kept.len() as u32;
-            let after_filter = kept.len() as u32;
-            let page_lines: Vec<TraceLine> = kept.into_iter()
-                .skip(req.offset as usize)
-                .take(limit as usize)
-                .collect();
-            (page_lines, after_filter, filtered_count)
+            (kept, filtered_count)
         } else {
-            // 无过滤：只加载分页所需的行
-            let page_seqs: Vec<u32> = all_seqs.iter()
-                .skip(req.offset as usize)
-                .take(limit as usize)
-                .copied()
-                .collect();
-            let page_lines = self.engine.get_lines(&sid, &page_seqs)
+            let all_lines = self.engine.get_lines(&sid, &all_seqs)
                 .map_err(|e| e.to_string())?;
-            (page_lines, total_tainted, 0u32)
+            (all_lines, 0u32)
         };
+
+        // 地址范围过滤
+        let after_addr_filter: Vec<TraceLine> = if let Some(ref range) = req.addr_range {
+            let (start, end) = parse_addr_range(range)?;
+            after_stack_filter.into_iter()
+                .filter(|l| line_in_addr_range(l, start, end))
+                .collect()
+        } else {
+            after_stack_filter
+        };
+
+        let total_after_filter = after_addr_filter.len() as u32;
+
+        // 分页
+        let page_lines: Vec<TraceLine> = after_addr_filter.into_iter()
+            .skip(req.offset as usize)
+            .take(limit as usize)
+            .collect();
 
         // 上下文摘要
         let context = self.engine.get_slice_origin(&sid)
@@ -513,15 +520,69 @@ impl TraceToolHandler {
                 ctx
             });
 
+        // 上下文行展开
+        if ctx_lines > 0 && !page_lines.is_empty() {
+            let tainted_seqs: std::collections::HashSet<u32> = page_lines.iter().map(|l| l.seq).collect();
+            let mut expanded_seqs = std::collections::BTreeSet::new();
+            for line in &page_lines {
+                let start = line.seq.saturating_sub(ctx_lines);
+                let end = line.seq.saturating_add(ctx_lines);
+                for s in start..=end {
+                    expanded_seqs.insert(s);
+                }
+            }
+            let extra_seqs: Vec<u32> = expanded_seqs.iter().copied()
+                .filter(|s| !tainted_seqs.contains(s))
+                .collect();
+            let extra_lines = self.engine.get_lines(&sid, &extra_seqs)
+                .unwrap_or_default();
+            let extra_map: std::collections::HashMap<u32, &TraceLine> = extra_lines.iter()
+                .map(|l| (l.seq, l))
+                .collect();
+
+            let mut output_lines: Vec<serde_json::Value> = Vec::new();
+            for seq in expanded_seqs {
+                if let Some(tl) = page_lines.iter().find(|l| l.seq == seq) {
+                    let mut obj = if req.full {
+                        serde_json::to_value(tl).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                    } else {
+                        compact_line(tl)
+                    };
+                    obj.as_object_mut().map(|o| o.insert("tainted".to_string(), serde_json::json!(true)));
+                    output_lines.push(obj);
+                } else if let Some(el) = extra_map.get(&seq) {
+                    let mut obj = if req.full {
+                        serde_json::to_value(*el).unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}))
+                    } else {
+                        compact_line(el)
+                    };
+                    obj.as_object_mut().map(|o| o.insert("tainted".to_string(), serde_json::json!(false)));
+                    output_lines.push(obj);
+                }
+            }
+
+            return Ok(json(&serde_json::json!({
+                "context": context,
+                "lines": output_lines,
+                "total_tainted": total_tainted,
+                "total_after_filter": total_after_filter,
+                "stack_ops_filtered": stack_ops_filtered,
+                "offset": req.offset,
+                "count": page_lines.len(),
+                "context_lines": ctx_lines,
+                "has_more": (req.offset as usize + page_lines.len()) < total_after_filter as usize,
+            })));
+        }
+
         Ok(json(&serde_json::json!({
             "context": context,
-            "lines": format_lines(&lines, req.full),
+            "lines": format_lines(&page_lines, req.full),
             "total_tainted": total_tainted,
             "total_after_filter": total_after_filter,
             "stack_ops_filtered": stack_ops_filtered,
             "offset": req.offset,
-            "count": lines.len(),
-            "has_more": (req.offset as usize + lines.len()) < total_after_filter as usize,
+            "count": page_lines.len(),
+            "has_more": (req.offset as usize + page_lines.len()) < total_after_filter as usize,
         })))
     }
 
@@ -768,6 +829,276 @@ impl TraceToolHandler {
                     "status": "String scanning completed.",
                 })))
                 .map_err(|e| e.to_string())
+        }).await
+    }
+
+    // ━━━━━━━━━━━━━━━━━━━━━━ Batch 2: 组合工具 ━━━━━━━━━━━━━━━━━━━━━━
+
+    #[tool(
+        name = "taint_analysis",
+        description = "Run backward taint analysis and return results in one call. \
+            Traces where a value came from by following data/control dependencies. \
+            Returns analysis stats plus the first page of tainted instructions. \
+            Use get_tainted_lines to paginate if has_more is true."
+    )]
+    async fn taint_analysis(&self, Parameters(req): Parameters<TaintAnalysisRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let engine = self.engine.clone();
+        blocking(move || {
+            // 1. 执行污点分析
+            let options = SliceOptions {
+                start_seq: req.start_seq,
+                end_seq: req.end_seq,
+                data_only: req.data_only,
+            };
+            let result = engine.run_slice(&sid, &req.from_specs, options)
+                .map_err(|e| e.to_string())?;
+
+            // 2. 仅返回统计信息
+            let include = req.include_lines.min(200);
+            if include == 0 {
+                return Ok(json(&serde_json::json!({
+                    "marked_count": result.marked_count,
+                    "total_lines": result.total_lines,
+                    "percentage": format!("{:.2}%", result.percentage),
+                    "lines": [],
+                    "total_after_filter": result.marked_count,
+                    "stack_ops_filtered": 0,
+                    "count": 0,
+                    "has_more": result.marked_count > 0,
+                    "hint": "Use get_tainted_lines to retrieve tainted instructions.",
+                })));
+            }
+
+            // 3. 获取污点行
+            let all_seqs = engine.get_tainted_seqs(&sid)
+                .map_err(|e| e.to_string())?;
+
+            if all_seqs.is_empty() {
+                return Ok(json(&serde_json::json!({
+                    "marked_count": result.marked_count,
+                    "total_lines": result.total_lines,
+                    "percentage": format!("{:.2}%", result.percentage),
+                    "lines": [],
+                    "total_after_filter": 0,
+                    "stack_ops_filtered": 0,
+                    "count": 0,
+                    "has_more": false,
+                })));
+            }
+
+            let all_lines = engine.get_lines(&sid, &all_seqs)
+                .map_err(|e| e.to_string())?;
+
+            // 4. 栈操作过滤
+            let (kept, stack_filtered) = if req.ignore_stack_ops {
+                let before = all_lines.len();
+                let filtered: Vec<TraceLine> = all_lines.into_iter()
+                    .filter(|l| !is_stack_only_change(&l.changes))
+                    .collect();
+                let diff = before - filtered.len();
+                (filtered, diff as u32)
+            } else {
+                (all_lines, 0u32)
+            };
+
+            // 5. 地址范围过滤
+            let after_addr: Vec<TraceLine> = if let Some(ref range) = req.addr_range {
+                let (start, end) = parse_addr_range(range)?;
+                kept.into_iter()
+                    .filter(|l| line_in_addr_range(l, start, end))
+                    .collect()
+            } else {
+                kept
+            };
+
+            let total_after_filter = after_addr.len();
+
+            // 6. 取前 include 行
+            let page: Vec<&TraceLine> = after_addr.iter().take(include as usize).collect();
+            let count = page.len();
+            let lines: Vec<serde_json::Value> = page.iter().map(|l| compact_line(l)).collect();
+
+            Ok(json(&serde_json::json!({
+                "marked_count": result.marked_count,
+                "total_lines": result.total_lines,
+                "percentage": format!("{:.2}%", result.percentage),
+                "lines": lines,
+                "total_after_filter": total_after_filter,
+                "stack_ops_filtered": stack_filtered,
+                "count": count,
+                "has_more": count < total_after_filter,
+                "hint": if count < total_after_filter {
+                    "Use get_tainted_lines with offset to see more results."
+                } else {
+                    "All tainted lines included."
+                },
+            })))
+        }).await
+    }
+
+    #[tool(
+        name = "analyze_function",
+        description = "Analyze a function call. Two modes: \
+            (1) node_id: detailed analysis with entry arguments (X0-X7) and return value (X0). \
+            (2) func_name: find all calls matching a name. \
+            Provide exactly one of node_id or func_name."
+    )]
+    fn analyze_function(&self, Parameters(req): Parameters<AnalyzeFunctionRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+
+        if let Some(node_id) = req.node_id {
+            // Mode 1: 按 node_id 分析函数调用详情
+            let nodes = self.engine.get_call_tree_children(&sid, node_id, true)
+                .map_err(|e| e.to_string())?;
+            let node = nodes.first()
+                .ok_or_else(|| format!("Node {} not found", node_id))?;
+
+            // 获取入口参数 X0-X7
+            let entry_regs = self.engine.get_registers_at(&sid, node.entry_seq)
+                .unwrap_or_default();
+            let mut args = serde_json::Map::new();
+            for i in 0..=7 {
+                let reg_name = format!("X{}", i);
+                if let Some(val) = entry_regs.get(&reg_name) {
+                    args.insert(reg_name, serde_json::json!(val));
+                }
+            }
+
+            // 获取返回值
+            let return_value = if node.exit_seq > node.entry_seq {
+                self.engine.get_registers_at(&sid, node.exit_seq)
+                    .ok()
+                    .and_then(|regs| regs.get("X0").cloned())
+            } else {
+                None
+            };
+
+            // 子调用
+            let children = nodes.iter().skip(1).collect::<Vec<_>>();
+            let sub_calls: Vec<serde_json::Value> = children.iter().map(|c| {
+                serde_json::json!({
+                    "node_id": c.id,
+                    "func_name": c.func_name,
+                    "func_addr": c.func_addr,
+                    "entry_seq": c.entry_seq,
+                    "exit_seq": c.exit_seq,
+                    "line_count": c.line_count,
+                })
+            }).collect();
+
+            Ok(json(&serde_json::json!({
+                "node_id": node.id,
+                "func_name": node.func_name,
+                "func_addr": node.func_addr,
+                "entry_seq": node.entry_seq,
+                "exit_seq": node.exit_seq,
+                "line_count": node.line_count,
+                "args": args,
+                "return_value": return_value,
+                "sub_calls": sub_calls,
+                "sub_call_count": sub_calls.len(),
+            })))
+
+        } else if let Some(ref func_name) = req.func_name {
+            // Mode 2: 按名称搜索函数
+            let result = self.engine.get_function_calls(&sid)
+                .map_err(|e| e.to_string())?;
+
+            let query_lower = func_name.to_lowercase();
+            let matched: Vec<serde_json::Value> = result.functions.iter()
+                .filter(|f| f.func_name.to_lowercase().contains(&query_lower))
+                .map(|f| {
+                    let occs: Vec<serde_json::Value> = f.occurrences.iter()
+                        .take(50)
+                        .map(|o| serde_json::json!({
+                            "seq": o.seq,
+                            "summary": o.summary,
+                        }))
+                        .collect();
+                    let total_occs = f.occurrences.len();
+                    serde_json::json!({
+                        "func_name": f.func_name,
+                        "call_count": total_occs,
+                        "is_jni": f.is_jni,
+                        "occurrences": occs,
+                        "occurrences_truncated": total_occs > 50,
+                    })
+                })
+                .collect();
+
+            Ok(json(&serde_json::json!({
+                "query": func_name,
+                "matched_functions": matched.len(),
+                "functions": matched,
+                "hint": if matched.is_empty() {
+                    "No functions matched. Try a broader search term or use get_function_list to see all functions."
+                } else {
+                    "Use analyze_function with node_id from get_call_tree to inspect a specific call's arguments and return value."
+                },
+            })))
+
+        } else {
+            Err("Provide either node_id or func_name. \
+                Example: {\"node_id\": 5} for call details, or {\"func_name\": \"malloc\"} to search.".into())
+        }
+    }
+
+    #[tool(
+        name = "analyze_crypto",
+        description = "Detect cryptographic algorithms in the trace with surrounding code context. \
+            Scans for magic constants of known algorithms (AES, SHA256, MD5, DES, etc.). \
+            Returns each detection with context instructions. \
+            Use taint_analysis on detection points to trace key/data sources."
+    )]
+    async fn analyze_crypto(&self, Parameters(req): Parameters<AnalyzeCryptoRequest>) -> Result<String, String> {
+        let sid = self.resolve_session(req.session_id)?;
+        let engine = self.engine.clone();
+        blocking(move || {
+            let ctx_count = req.context_lines.min(10);
+
+            // 1. 尝试缓存，否则扫描
+            let scan_result = if let Ok(Some(cached)) = engine.load_crypto_cache(&sid) {
+                cached
+            } else {
+                engine.scan_crypto(&sid)
+                    .map_err(|e| e.to_string())?
+            };
+
+            // 2. 为每个匹配收集上下文行
+            let mut matches_output: Vec<serde_json::Value> = Vec::new();
+            for m in &scan_result.matches {
+                let start = m.seq.saturating_sub(ctx_count);
+                let end = m.seq.saturating_add(ctx_count);
+                let ctx_seqs: Vec<u32> = (start..=end).collect();
+                let ctx_lines = engine.get_lines(&sid, &ctx_seqs)
+                    .unwrap_or_default();
+
+                let context: Vec<serde_json::Value> = ctx_lines.iter().map(|l| {
+                    let mut obj = compact_line(l);
+                    obj.as_object_mut().map(|o| {
+                        o.insert("is_match".to_string(), serde_json::json!(l.seq == m.seq));
+                    });
+                    obj
+                }).collect();
+
+                matches_output.push(serde_json::json!({
+                    "algorithm": m.algorithm,
+                    "magic_hex": m.magic_hex,
+                    "seq": m.seq,
+                    "address": m.address,
+                    "disasm": m.disasm,
+                    "context": context,
+                }));
+            }
+
+            Ok(json(&serde_json::json!({
+                "algorithms_found": scan_result.algorithms_found,
+                "match_count": scan_result.matches.len(),
+                "matches": matches_output,
+                "total_lines_scanned": scan_result.total_lines_scanned,
+                "hint": "Use taint_analysis with 'reg:X0@<seq>' on a match's seq to trace the key/data source.",
+            })))
         }).await
     }
 }

@@ -145,6 +145,11 @@ pub struct GetTaintedLinesRequest {
     #[schemars(description = "Filter out lines that only modify stack/frame pointer registers (sp, x29). Default: true")]
     #[serde(default = "default_true")]
     pub ignore_stack_ops: bool,
+    #[schemars(description = "Filter by SO offset address range, e.g. '0x246F00-0x249800'")]
+    pub addr_range: Option<String>,
+    #[schemars(description = "Include N non-tainted context lines before/after each tainted line (default: 0, max: 5)")]
+    #[serde(default)]
+    pub context_lines: u32,
 }
 
 fn default_taint_limit() -> u32 { 50 }
@@ -286,3 +291,53 @@ pub struct ScanStringsRequest {
     #[schemars(description = "Session ID (optional if only one session is open)")]
     pub session_id: Option<String>,
 }
+
+// ── Batch 2 新增工具请求类型 ──
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TaintAnalysisRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Taint sources (case-insensitive register names): \
+        'reg:X0@1234' (register at line), 'mem:0xbffff000@1234' (memory at line), \
+        '@last' for last definition. Examples: ['reg:X0@last'], ['mem:0xbffff000@5930']")]
+    pub from_specs: Vec<String>,
+    #[schemars(description = "Only track data dependencies, ignore control flow (recommended for reducing noise)")]
+    #[serde(default)]
+    pub data_only: bool,
+    #[schemars(description = "Restrict analysis to lines >= this seq")]
+    pub start_seq: Option<u32>,
+    #[schemars(description = "Restrict analysis to lines <= this seq")]
+    pub end_seq: Option<u32>,
+    #[schemars(description = "Number of tainted lines to include in result (default: 30, 0=stats only, max: 200)")]
+    #[serde(default = "default_inline_lines")]
+    pub include_lines: u32,
+    #[schemars(description = "Filter results by SO offset address range, e.g. '0x246F00-0x249800'")]
+    pub addr_range: Option<String>,
+    #[schemars(description = "Filter out lines that only modify stack/frame pointer registers (default: true)")]
+    #[serde(default = "default_true")]
+    pub ignore_stack_ops: bool,
+}
+
+fn default_inline_lines() -> u32 { 30 }
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeFunctionRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Call tree node ID for detailed analysis of a specific function call (from get_call_tree)")]
+    pub node_id: Option<u32>,
+    #[schemars(description = "Search for all calls to functions matching this name (partial, case-insensitive)")]
+    pub func_name: Option<String>,
+}
+
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct AnalyzeCryptoRequest {
+    #[schemars(description = "Session ID (optional if only one session is open)")]
+    pub session_id: Option<String>,
+    #[schemars(description = "Number of context lines around each crypto match (default: 3, max: 10)")]
+    #[serde(default = "default_crypto_context")]
+    pub context_lines: u32,
+}
+
+fn default_crypto_context() -> u32 { 3 }
