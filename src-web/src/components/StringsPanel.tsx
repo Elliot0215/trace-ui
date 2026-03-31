@@ -36,65 +36,85 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
     display: "flex", alignItems: "center", justifyContent: "center",
   };
 
-  const [strings, setStrings] = useState<StringRecordDto[]>([]);
   const [total, setTotal] = useState(0);
   const [minLen, setMinLen] = useState(4);
   const [search, setSearch] = useState("");
-  const [loading, setLoading] = useState(false);
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; record: StringRecordDto } | null>(null);
+  const [pageVersion, setPageVersion] = useState(0);
+  const loading = total === 0 && pageVersion === 0;
 
   const [searchHistory, setSearchHistory] = useState<string[]>(() => {
     try { return JSON.parse(localStorage.getItem(HISTORY_KEY) || "[]"); } catch { return []; }
   });
   const [showHistory, setShowHistory] = useState(false);
-  const historyBlurTimer = useRef<ReturnType<typeof setTimeout>>(undefined);
   const searchWrapperRef = useRef<HTMLDivElement>(null);
-
   const searchTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
   const minLenTimerRef = useRef<ReturnType<typeof setTimeout>>(undefined);
-  const pendingRef = useRef(0);
 
-  // ── 数据加载 ──
-  const loadStrings = useCallback(async (offset: number, reset: boolean) => {
+  // ── 按页缓存（方案 C：index→seq 映射与详情分离） ──
+  const pageCacheRef = useRef<Map<number, StringRecordDto[]>>(new Map());
+  const loadingPagesRef = useRef<Set<number>>(new Set());
+
+  const getRecordAtIndex = useCallback((index: number): StringRecordDto | undefined => {
+    const page = Math.floor(index / PAGE_SIZE);
+    const records = pageCacheRef.current.get(page);
+    return records?.[index % PAGE_SIZE];
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageVersion]);
+
+  const loadPage = useCallback(async (pageNum: number) => {
+    if (pageCacheRef.current.has(pageNum) || loadingPagesRef.current.has(pageNum)) return;
     if (!sessionId || !isPhase2Ready) return;
-    const reqId = ++pendingRef.current;
-    if (reset) setLoading(true);
-
+    loadingPagesRef.current.add(pageNum);
     try {
       const result = await invoke<StringsResult>("get_strings", {
         sessionId,
         minLen,
-        offset,
+        offset: pageNum * PAGE_SIZE,
         limit: PAGE_SIZE,
         search: search || null,
       });
-      if (reqId !== pendingRef.current) return;
-      if (reset) {
-        setStrings(result.strings);
-      } else {
-        setStrings(prev => [...prev, ...result.strings]);
-      }
+      pageCacheRef.current.set(pageNum, result.strings);
       setTotal(result.total);
+      setPageVersion(v => v + 1);
     } catch (e) {
       console.error("get_strings failed:", e);
     } finally {
-      if (reqId === pendingRef.current) setLoading(false);
+      loadingPagesRef.current.delete(pageNum);
     }
   }, [sessionId, isPhase2Ready, minLen, search]);
 
+  const ensureRange = useCallback((startIdx: number, endIdx: number) => {
+    if (total === 0) return;
+    const startPage = Math.floor(Math.max(0, startIdx) / PAGE_SIZE);
+    const endPage = Math.floor(Math.min(endIdx, total - 1) / PAGE_SIZE);
+    for (let p = startPage; p <= endPage; p++) {
+      loadPage(p);
+    }
+  }, [total, loadPage]);
+
+  // ── 初始加载 + 搜索/minLen 变化时重置缓存 ──
   useEffect(() => {
-    loadStrings(0, true);
-  }, [loadStrings]);
+    pageCacheRef.current.clear();
+    loadingPagesRef.current.clear();
+    setPageVersion(v => v + 1);
+    setTotal(0);
+    loadPage(0);
+  }, [loadPage]);
 
   // ── scanning 结束后自动刷新 ──
   const prevScanningRef = useRef(false);
   useEffect(() => {
     if (prevScanningRef.current && !stringsScanning) {
-      loadStrings(0, true);
+      pageCacheRef.current.clear();
+      loadingPagesRef.current.clear();
+      setPageVersion(v => v + 1);
+      setTotal(0);
+      loadPage(0);
     }
     prevScanningRef.current = !!stringsScanning;
-  }, [stringsScanning, loadStrings]);
+  }, [stringsScanning, loadPage]);
 
   // ── 搜索 debounce ──
   const [searchInput, setSearchInput] = useState("");
@@ -153,14 +173,32 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
   }, [minLenInput]);
 
   // ── 虚拟滚动 ──
-  const vs = useVirtualScroll({ totalCount: strings.length, rowHeight: ROW_HEIGHT, overscan: 20 });
+  const vs = useVirtualScroll({ totalCount: total, rowHeight: ROW_HEIGHT, overscan: 20 });
 
-  // ── 无限滚动加载更多 ──
+  // ── 按需加载：可视范围变化时确保对应页已加载 ──
   useEffect(() => {
-    if (vs.endIdx >= strings.length - 50 && strings.length < total && !loading) {
-      loadStrings(strings.length, false);
+    if (total === 0) return;
+    ensureRange(vs.startIdx, vs.endIdx);
+  }, [vs.startIdx, vs.endIdx, total, ensureRange]);
+
+  // ── Minimap 采样页预加载：逐页加载 minimap 需要的稀疏页 ──
+  useEffect(() => {
+    if (total === 0 || vs.containerHeight === 0) return;
+    const mmRows = Math.floor(vs.containerHeight / 2); // MINIMAP_ROW_HEIGHT = 2
+    if (mmRows === 0) return;
+    const neededPages = new Set<number>();
+    for (let i = 0; i < mmRows; i++) {
+      const vi = Math.round(i * total / mmRows);
+      if (vi >= total) break;
+      neededPages.add(Math.floor(vi / PAGE_SIZE));
     }
-  }, [vs.endIdx, strings.length, total, loading, loadStrings]);
+    for (const p of neededPages) {
+      if (!pageCacheRef.current.has(p) && !loadingPagesRef.current.has(p)) {
+        loadPage(p);
+        return; // 每次只加载一页，加载完成后 pageVersion 变化会重新触发此 effect
+      }
+    }
+  }, [total, vs.containerHeight, pageVersion, loadPage]);
 
   // ── 点击行：选中 + 跳转 trace 表 ──
   const handleRowClick = useCallback((record: StringRecordDto) => {
@@ -253,35 +291,46 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
   }, [vs.scrollToRow]);
 
   const resolveVirtualIndex = useCallback((vi: number): ResolvedRow => {
-    return { type: "line", seq: strings[vi]?.seq ?? vi } as ResolvedRow;
-  }, [strings]);
+    const record = getRecordAtIndex(vi);
+    return { type: "line", seq: record?.seq ?? -1 } as ResolvedRow;
+  }, [getRecordAtIndex]);
 
   const getLines = useCallback(async (seqs: number[]): Promise<TraceLine[]> => {
-    const seqSet = new Set(seqs);
-    const lines: TraceLine[] = [];
-    for (const record of strings) {
-      if (seqSet.has(record.seq)) {
-        lines.push({
-          seq: record.seq,
-          address: record.addr,
-          so_offset: record.addr,
-          so_name: null,
-          disasm: record.content,
-          changes: record.rw,
-          reg_before: "",
-          mem_rw: record.rw,
-          mem_addr: null,
-          mem_size: null,
-          raw: "",
-          call_info: null,
-        });
-      }
+    const seqMap = new Map<number, StringRecordDto>();
+    for (const [, records] of pageCacheRef.current) {
+      for (const r of records) seqMap.set(r.seq, r);
     }
-    return lines;
-  }, [strings]);
+    return seqs
+      .map(seq => seqMap.get(seq))
+      .filter((r): r is StringRecordDto => r !== undefined)
+      .map(r => ({
+        seq: r.seq,
+        address: r.addr,
+        so_offset: r.addr,
+        so_name: null,
+        disasm: r.content,
+        changes: r.rw,
+        reg_before: "",
+        mem_rw: r.rw,
+        mem_addr: null,
+        mem_size: null,
+        raw: "",
+        call_info: null,
+      }));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pageVersion]);
 
   const selectedSeq = selectedIdx != null
-    ? strings.find(r => r.idx === selectedIdx)?.seq ?? null
+    ? getRecordAtIndex(
+        // 找到 selectedIdx 对应的全局 index —— 向缓存中查找
+        (() => {
+          for (const [pageNum, records] of pageCacheRef.current) {
+            const idx = records.findIndex(r => r.idx === selectedIdx);
+            if (idx >= 0) return pageNum * PAGE_SIZE + idx;
+          }
+          return -1;
+        })()
+      )?.seq ?? null
     : null;
 
   if (!isPhase2Ready) {
@@ -411,7 +460,7 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
         gutterWidth={MINIMAP_WIDTH + 12}
         gutterContent={
           <Minimap
-            virtualTotalRows={strings.length}
+            virtualTotalRows={total}
             visibleRows={vs.visibleRows}
             currentRow={vs.currentRow}
             maxRow={vs.maxRow}
@@ -428,8 +477,22 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
       >
         {Array.from({ length: Math.max(0, vs.endIdx - vs.startIdx + 1) }, (_, i) => {
           const index = vs.startIdx + i;
-          const record = strings[index];
-          if (!record) return null;
+          const record = getRecordAtIndex(index);
+          if (!record) {
+            return (
+              <div
+                key={index}
+                style={{
+                  position: "absolute", top: 0, left: 0, width: "100%", height: ROW_HEIGHT,
+                  transform: `translateY(${vs.getItemY(index)}px)`,
+                  display: "flex", alignItems: "center", padding: "0 8px",
+                  background: index % 2 === 0 ? "var(--bg-row-even)" : "var(--bg-row-odd)",
+                }}
+              >
+                <span style={{ color: "var(--text-disabled, #555)", fontSize: "var(--font-size-sm)" }}>Loading...</span>
+              </div>
+            );
+          }
           const isSelected = record.idx === selectedIdx;
           return (
             <div
