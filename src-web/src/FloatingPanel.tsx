@@ -13,6 +13,7 @@ import type { SearchMatch, SearchResult } from "./types/trace";
 import SearchBar, { SearchOptions } from "./components/SearchBar";
 import { usePreferences } from "./hooks/usePreferences";
 import { useSearchMatchCache } from "./hooks/useSearchMatchCache";
+import { useSearchPages } from "./hooks/useSearchPages";
 import { findNearestSeqIndex } from "./utils/binarySearch";
 
 const PANEL_TITLES: Record<string, string> = {
@@ -114,7 +115,6 @@ export default function FloatingPanel({ panel }: { panel: string }) {
         sessionId: syncState.sessionId,
         request: {
           query: finalQuery,
-          max_results: 10000,
           case_sensitive: options?.caseSensitive ?? false,
           use_regex: finalUseRegex,
           fuzzy: options?.fuzzyMatch ?? false,
@@ -124,9 +124,7 @@ export default function FloatingPanel({ panel }: { panel: string }) {
       setSearchTotalMatches(result.total_matches);
       const statusText = result.total_matches === 0
         ? `No results found for "${query}"`
-        : result.truncated
-          ? `Showing first ${result.match_seqs.length.toLocaleString()} of ${result.total_matches.toLocaleString()} results`
-          : `${result.total_matches.toLocaleString()} results`;
+        : `${result.total_matches.toLocaleString()} results`;
       setSearchStatus(statusText);
       emit("sync:search-results-back", {
         matchSeqs: result.match_seqs,
@@ -271,6 +269,7 @@ function FloatingSearchContent({
   const [queryParams, setQueryParams] = useState<{ query: string; caseSensitive: boolean; useRegex: boolean; fuzzy: boolean } | null>(null);
 
   const cache = useSearchMatchCache(sessionId, queryParams, searchGen);
+  const searchPages = useSearchPages();
 
   // 新搜索开始时递增 generation 并清空缓存（绑定到 searchQuery 变化，而非 matchSeqs）
   useEffect(() => {
@@ -278,6 +277,19 @@ function FloatingSearchContent({
     setSearchGen(searchGenRef.current);
     cache.clear();
   }, [searchQuery]);
+
+  // 搜索结果变化时，重置分页状态
+  useEffect(() => {
+    if (matchSeqs.length === 0 && searchTotalMatches === 0) {
+      searchPages.reset(0, [], sessionId ?? "");
+      setSelectedIdx(-1);
+      return;
+    }
+    searchPages.reset(searchTotalMatches, matchSeqs, sessionId ?? "");
+    if (currentSeq == null) { setSelectedIdx(0); return; }
+    setSelectedIdx(findNearestSeqIndex(matchSeqs, currentSeq));
+    cache.getMatches(matchSeqs.slice(0, 50));
+  }, [matchSeqs, searchTotalMatches]);
 
   const wrappedOnSearch = useCallback((query: string, options: SearchOptions) => {
     setQueryParams({
@@ -324,23 +336,16 @@ function FloatingSearchContent({
   }, [localQuery]);
 
   useEffect(() => { setLocalQuery(searchQuery); }, [searchQuery]);
-  // 搜索结果变化时，自动选中距离当前 TraceTable 选中行最近的结果，并预加载可见行详情
-  useEffect(() => {
-    if (matchSeqs.length === 0) { setSelectedIdx(-1); return; }
-    if (currentSeq == null) { setSelectedIdx(0); return; }
-    setSelectedIdx(findNearestSeqIndex(matchSeqs, currentSeq));
-    cache.getMatches(matchSeqs.slice(0, 50));
-  }, [matchSeqs]);
 
   const handlePrevMatch = useCallback(() => {
-    if (matchSeqs.length === 0) return;
-    setSelectedIdx(prev => prev <= 0 ? matchSeqs.length - 1 : prev - 1);
-  }, [matchSeqs.length]);
+    if (searchPages.totalCount === 0) return;
+    setSelectedIdx(prev => prev <= 0 ? searchPages.totalCount - 1 : prev - 1);
+  }, [searchPages.totalCount]);
 
   const handleNextMatch = useCallback(() => {
-    if (matchSeqs.length === 0) return;
-    setSelectedIdx(prev => (prev + 1) % matchSeqs.length);
-  }, [matchSeqs.length]);
+    if (searchPages.totalCount === 0) return;
+    setSelectedIdx(prev => (prev + 1) % searchPages.totalCount);
+  }, [searchPages.totalCount]);
 
   const handleJumpToSearchMatch = useCallback((match: SearchMatch) => {
     emit("action:jump-to-search-match", { seq: match.seq, hasCallInfo: !!match.call_info });
@@ -348,7 +353,7 @@ function FloatingSearchContent({
 
   const matchInfo = isSearching
     ? "Searching..."
-    : matchSeqs.length === 0
+    : searchPages.totalCount === 0
       ? (searchQuery ? "No results" : "")
       : selectedIdx < 0
         ? `${searchTotalMatches.toLocaleString()} results`
@@ -366,11 +371,11 @@ function FloatingSearchContent({
         inputRef={inputRef}
         onOptionsChange={handleOptionsChange}
       />
-      {isSearching || (matchSeqs.length > 0 && cache.cacheSize === 0) ? (
+      {isSearching || (searchPages.totalCount > 0 && cache.cacheSize === 0) ? (
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <span style={{ color: "var(--text-secondary)", fontSize: 12 }}>Searching...</span>
         </div>
-      ) : matchSeqs.length === 0 ? (
+      ) : searchPages.totalCount === 0 ? (
         <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
           <span style={{ color: "var(--text-secondary)", fontSize: 12 }}>
             {searchQuery ? `No results found for "${searchQuery}"` : "Enter search query and press Enter"}
@@ -379,9 +384,12 @@ function FloatingSearchContent({
       ) : (
         <div style={{ flex: 1, display: "flex", flexDirection: "column", overflow: "hidden" }}>
           <SearchResultList
-            matchSeqs={matchSeqs}
+            totalCount={searchPages.totalCount}
+            getSeqAtIndex={searchPages.getSeqAtIndex}
+            ensureRange={searchPages.ensureRange}
+            findSeqIndex={searchPages.findSeqIndex}
             getMatchDetail={cache.getMatch}
-            selectedSeq={matchSeqs[selectedIdx] ?? null}
+            selectedSeq={searchPages.getSeqAtIndex(selectedIdx) ?? null}
             onJumpToSeq={onJumpToSeq}
             onJumpToMatch={handleJumpToSearchMatch}
             searchQuery={searchQuery}
@@ -393,6 +401,7 @@ function FloatingSearchContent({
             addrColorHighlight={preferences.addrColorHighlight}
             requestDetails={(seqs) => { cache.getMatches(seqs); }}
             cacheVersion={cache.cacheSize}
+            pageVersion={searchPages.pageVersion}
           />
         </div>
       )}

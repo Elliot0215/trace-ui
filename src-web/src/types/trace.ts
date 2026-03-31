@@ -58,6 +58,7 @@ export interface SearchMatch {
 }
 
 export interface SearchResult {
+  /** 首页匹配序列号（非全量，通过 fetch_search_page 分页拉取剩余） */
   match_seqs: number[];
   total_scanned: number;
   total_matches: number;

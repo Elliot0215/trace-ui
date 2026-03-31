@@ -318,15 +318,13 @@ export function useTraceStore(skipStrings: boolean = false) {
     try {
       const result = await invoke<SearchResult>("search_trace", {
         sessionId: sid,
-        request: { query, max_results: 10000, case_sensitive: caseSensitive, use_regex: useRegex, fuzzy },
+        request: { query, case_sensitive: caseSensitive, use_regex: useRegex, fuzzy },
       });
       setMatchSeqs(result.match_seqs);
       setSearchTotalMatches(result.total_matches);
       const statusText = result.total_matches === 0
           ? `No results found for "${origQuery}"`
-          : result.truncated
-              ? `Showing first ${result.match_seqs.length.toLocaleString()} of ${result.total_matches.toLocaleString()} results`
-              : `${result.total_matches.toLocaleString()} results`;
+          : `${result.total_matches.toLocaleString()} results`;
       setSearchStatus(statusText);
       return result.total_matches;
     } catch (e) {

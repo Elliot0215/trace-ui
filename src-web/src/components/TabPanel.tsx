@@ -4,6 +4,7 @@ import { invoke } from "@tauri-apps/api/core";
 import { openDepTreeWindow } from "../utils/openDepTreeWindow";
 import { useDragToFloat } from "../hooks/useDragToFloat";
 import { useSearchMatchCache } from "../hooks/useSearchMatchCache";
+import { useSearchPages } from "../hooks/useSearchPages";
 import { findNearestSeqIndex } from "../utils/binarySearch";
 import type { SearchMatch, SliceResult, CryptoScanResult } from "../types/trace";
 import MemoryPanel from "./MemoryPanel";
@@ -169,6 +170,7 @@ export default function TabPanel({
   [searchQuery, searchOptions]);
 
   const cache = useSearchMatchCache(sessionId, queryParams, searchGen);
+  const searchPages = useSearchPages();
 
   // 同步外部 searchQuery 变化
   useEffect(() => { setLocalSearchQuery(searchQuery); }, [searchQuery]);
@@ -187,14 +189,18 @@ export default function TabPanel({
     };
   }, []);
 
-  // 搜索结果变化时，自动选中距离当前 TraceTable 选中行最近的结果，并预加载可见行详情
+  // 搜索结果变化时，重置分页状态，自动选中距离当前 TraceTable 选中行最近的结果
   useEffect(() => {
-    if (matchSeqs.length === 0) { setSelectedSearchIdx(-1); return; }
+    if (matchSeqs.length === 0 && searchTotalMatches === 0) {
+      searchPages.reset(0, [], sessionId ?? "");
+      setSelectedSearchIdx(-1);
+      return;
+    }
+    searchPages.reset(searchTotalMatches, matchSeqs, sessionId ?? "");
     if (currentSeq == null) { setSelectedSearchIdx(0); return; }
     setSelectedSearchIdx(findNearestSeqIndex(matchSeqs, currentSeq));
-    // 主动预加载前 50 条结果的详情（避免等 SearchResultList 渲染才触发加载）
     cache.getMatches(matchSeqs.slice(0, 50));
-  }, [matchSeqs]);
+  }, [matchSeqs, searchTotalMatches]);
 
   // 监听 action:activate-search-tab 事件
   useEffect(() => {
@@ -218,22 +224,22 @@ export default function TabPanel({
   }, [floatedPanels]);
 
   const handlePrevMatch = useCallback(() => {
-    if (matchSeqs.length === 0) return;
+    if (searchPages.totalCount === 0) return;
     setSelectedSearchIdx(prev =>
-      prev <= 0 ? matchSeqs.length - 1 : prev - 1
+      prev <= 0 ? searchPages.totalCount - 1 : prev - 1
     );
-  }, [matchSeqs.length]);
+  }, [searchPages.totalCount]);
 
   const handleNextMatch = useCallback(() => {
-    if (matchSeqs.length === 0) return;
+    if (searchPages.totalCount === 0) return;
     setSelectedSearchIdx(prev =>
-      (prev + 1) % matchSeqs.length
+      (prev + 1) % searchPages.totalCount
     );
-  }, [matchSeqs.length]);
+  }, [searchPages.totalCount]);
 
   const searchMatchInfo = isSearching
     ? "Searching..."
-    : matchSeqs.length === 0
+    : searchPages.totalCount === 0
       ? (searchQuery ? "No results" : "")
       : selectedSearchIdx < 0
         ? `${searchTotalMatches.toLocaleString()} results`
@@ -310,11 +316,11 @@ export default function TabPanel({
           initialOptions={searchOptions}
           onOptionsChange={setSearchOptions}
         />
-        {isSearching || (matchSeqs.length > 0 && cache.cacheSize === 0) ? (
+        {isSearching || (searchPages.totalCount > 0 && cache.cacheSize === 0) ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
             <span style={{ color: "var(--text-secondary)", fontSize: 12 }}>Searching...</span>
           </div>
-        ) : matchSeqs.length === 0 ? (
+        ) : searchPages.totalCount === 0 ? (
           <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
             <span style={{ color: "var(--text-secondary)", fontSize: 12 }}>
               {searchQuery ? `No results found for "${searchQuery}"` : "Enter search query and press Enter"}
@@ -323,9 +329,12 @@ export default function TabPanel({
         ) : (
           <>
             <SearchResultList
-              matchSeqs={matchSeqs}
+              totalCount={searchPages.totalCount}
+              getSeqAtIndex={searchPages.getSeqAtIndex}
+              ensureRange={searchPages.ensureRange}
+              findSeqIndex={searchPages.findSeqIndex}
               getMatchDetail={cache.getMatch}
-              selectedSeq={matchSeqs[selectedSearchIdx] ?? null}
+              selectedSeq={searchPages.getSeqAtIndex(selectedSearchIdx) ?? null}
               onJumpToSeq={onJumpToSeq}
               onJumpToMatch={onJumpToSearchMatch}
               searchQuery={searchQuery}
@@ -337,6 +346,7 @@ export default function TabPanel({
               addrColorHighlight={addrColorHighlight}
               requestDetails={(seqs) => { cache.getMatches(seqs); }}
               cacheVersion={cache.cacheSize}
+              pageVersion={searchPages.pageVersion}
             />
             {searchStatus && (
               <div style={{

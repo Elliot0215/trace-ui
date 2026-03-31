@@ -146,8 +146,8 @@ pub fn get_consumed_seqs(
 #[derive(Deserialize)]
 pub struct SearchRequest {
     pub query: String,
-    #[serde(default = "default_max_results")]
-    pub max_results: u32,
+    #[serde(default)]
+    pub max_results: Option<u32>,
     #[serde(default)]
     pub case_sensitive: bool,
     #[serde(default)]
@@ -155,8 +155,6 @@ pub struct SearchRequest {
     #[serde(default)]
     pub fuzzy: bool,
 }
-
-fn default_max_results() -> u32 { 100000 }
 
 #[tauri::command]
 pub async fn search_trace(
@@ -173,12 +171,30 @@ pub async fn search_trace(
                 case_sensitive: request.case_sensitive,
                 use_regex: request.use_regex,
                 fuzzy: request.fuzzy,
-                max_results: Some(request.max_results),
+                max_results: request.max_results,
             },
         ).map_err(|e| e.to_string())
     })
     .await
     .map_err(|e| format!("Task execution failed: {}", e))?
+}
+
+#[derive(Serialize)]
+pub struct SearchPageResult {
+    pub generation: u64,
+    pub seqs: Vec<u32>,
+}
+
+#[tauri::command]
+pub fn fetch_search_page(
+    session_id: String,
+    offset: u32,
+    count: u32,
+    engine: State<'_, Arc<TraceEngine>>,
+) -> Result<SearchPageResult, String> {
+    let (gen, seqs) = engine.fetch_search_page(&session_id, offset, count)
+        .map_err(|e| e.to_string())?;
+    Ok(SearchPageResult { generation: gen, seqs })
 }
 
 #[derive(Deserialize)]

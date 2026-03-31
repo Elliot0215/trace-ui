@@ -12,6 +12,9 @@ use crate::utils::ascii_contains;
 
 use super::TraceEngine;
 
+/// 搜索首页返回的最大序列号数量
+const SEARCH_FIRST_PAGE_SIZE: usize = 5000;
+
 // ── Search mode ──
 
 enum SearchMode {
@@ -192,7 +195,11 @@ impl TraceEngine {
         query: &str,
         options: SearchOptions,
     ) -> Result<SearchResultLite> {
+        let handle = self.get_handle(session_id)?;
+
         if query.is_empty() {
+            *handle.search_cache.lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))? = (0, Vec::new());
             return Ok(SearchResultLite {
                 match_seqs: Vec::new(),
                 total_scanned: 0,
@@ -202,7 +209,8 @@ impl TraceEngine {
         }
 
         let mode = parse_search_mode(query, options.case_sensitive, options.use_regex, options.fuzzy)?;
-        let max_results = options.max_results.unwrap_or(100000);
+        let paginated = options.max_results.is_none();
+        let max_results = if paginated { usize::MAX } else { options.max_results.unwrap() as usize };
 
         let num_cpus = std::thread::available_parallelism()
             .map(|n| n.get())
@@ -210,7 +218,6 @@ impl TraceEngine {
 
         // 从 session 中提取搜索所需数据，并预计算分块边界
         let (mmap_arc, total_lines, call_search_texts, consumed_seqs, chunks) = {
-            let handle = self.get_handle(session_id)?;
             let state = handle
                 .state
                 .read()
@@ -222,7 +229,6 @@ impl TraceEngine {
                 .map(|s| s.total_lines())
                 .unwrap_or(0);
 
-            // 预计算并行分块边界（在持锁期间使用 line_index_view）
             let chunks: Option<Vec<(u32, u32, usize)>> =
                 if num_cpus > 1 && total_lines > 10000 {
                     state.line_index_view().map(|li| {
@@ -261,8 +267,7 @@ impl TraceEngine {
 
         let data: Arc<memmap2::Mmap> = mmap_arc;
 
-        if let Some(chunks) = chunks {
-            // 并行搜索各分块
+        let (all_seqs, total_matches) = if let Some(chunks) = chunks {
             let chunk_results: Vec<(Vec<u32>, u32)> = chunks
                 .par_iter()
                 .map(|&(start_seq, end_seq, start_offset)| {
@@ -274,30 +279,24 @@ impl TraceEngine {
                         &mode,
                         &consumed_seqs,
                         &call_search_texts,
-                        max_results as usize,
+                        max_results,
                     )
                 })
                 .collect();
 
-            // 合并结果（各块按 seq 天然有序）
-            let mut all_seqs = Vec::new();
-            let mut total_matches = 0u32;
+            let mut merged = Vec::new();
+            let mut tm = 0u32;
             for (chunk_seqs, chunk_total) in chunk_results {
-                total_matches += chunk_total;
-                if all_seqs.len() < max_results as usize {
-                    let remaining = max_results as usize - all_seqs.len();
-                    all_seqs.extend(chunk_seqs.into_iter().take(remaining));
+                tm += chunk_total;
+                if paginated {
+                    merged.extend(chunk_seqs);
+                } else if merged.len() < max_results {
+                    let remaining = max_results - merged.len();
+                    merged.extend(chunk_seqs.into_iter().take(remaining));
                 }
             }
-
-            Ok(SearchResultLite {
-                match_seqs: all_seqs,
-                total_scanned: total_lines,
-                total_matches,
-                truncated: total_matches > max_results,
-            })
+            (merged, tm)
         } else {
-            // 单线程搜索（行数少或无 lidx_store 时）
             let (match_seqs, total_matches) = search_chunk_seqs(
                 &data,
                 0,
@@ -306,16 +305,50 @@ impl TraceEngine {
                 &mode,
                 &consumed_seqs,
                 &call_search_texts,
-                max_results as usize,
+                max_results,
             );
+            (match_seqs, total_matches)
+        };
 
+        if paginated {
+            // 全量模式：缓存结果，只返回首页
+            let first_page_end = SEARCH_FIRST_PAGE_SIZE.min(all_seqs.len());
+            let first_page = all_seqs[..first_page_end].to_vec();
+            let mut cache = handle.search_cache.lock()
+                .map_err(|e| TraceError::Internal(e.to_string()))?;
+            let gen = cache.0 + 1;
+            *cache = (gen, all_seqs); // move, not clone
             Ok(SearchResultLite {
-                match_seqs,
+                match_seqs: first_page,
                 total_scanned: total_lines,
                 total_matches,
-                truncated: total_matches > max_results,
+                truncated: total_matches as usize > SEARCH_FIRST_PAGE_SIZE,
+            })
+        } else {
+            // 截断模式（GotoOverlay / MCP）：不缓存，按原逻辑返回
+            Ok(SearchResultLite {
+                match_seqs: all_seqs,
+                total_scanned: total_lines,
+                total_matches,
+                truncated: total_matches > max_results as u32,
             })
         }
+    }
+
+    /// 从缓存的搜索结果中拉取指定范围的匹配序列号
+    pub fn fetch_search_page(
+        &self,
+        session_id: &str,
+        offset: u32,
+        count: u32,
+    ) -> Result<(u64, Vec<u32>)> {
+        let handle = self.get_handle(session_id)?;
+        let cache = handle.search_cache.lock()
+            .map_err(|e| TraceError::Internal(e.to_string()))?;
+        let (gen, ref all_seqs) = *cache;
+        let start = (offset as usize).min(all_seqs.len());
+        let end = (start + count as usize).min(all_seqs.len());
+        Ok((gen, all_seqs[start..end].to_vec()))
     }
 
     pub fn get_search_matches(

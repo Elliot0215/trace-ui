@@ -49,6 +49,7 @@ fn main() {
             commands::get_call_tree_node_count,
             commands::get_call_tree_children,
             commands::search_trace,
+            commands::fetch_search_page,
             commands::get_search_matches,
             commands::get_memory_at,
             commands::get_mem_history_meta,

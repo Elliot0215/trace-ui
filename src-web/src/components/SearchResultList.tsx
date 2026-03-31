@@ -1,5 +1,4 @@
 import { useRef, useCallback, useEffect, useState, useMemo } from "react";
-import { useVirtualizerNoSync } from "../hooks/useVirtualizerNoSync";
 import type { SearchMatch, TraceLine } from "../types/trace";
 import type { ResolvedRow } from "../hooks/useFoldState";
 import DisasmHighlight from "./DisasmHighlight";
@@ -9,7 +8,6 @@ import CustomScrollbar from "./CustomScrollbar";
 import { useResizableColumn } from "../hooks/useResizableColumn";
 import { highlightText, highlightHexdump } from "../utils/highlightText";
 import VirtualizedHighlight from "./VirtualizedHighlight";
-import { findSeqIndex } from "../utils/binarySearch";
 
 const BASE_ROW_HEIGHT = 22;
 const DETAIL_LINE_HEIGHT = 16;
@@ -20,14 +18,27 @@ const DETAIL_BORDER = 1;
 const DETAIL_INDENT = 40 + 30 + 90 + 90;
 const DETAIL_LEFT_PADDING = 8 + DETAIL_INDENT;
 const DETAIL_MAX_LINES = 16; // hexdump 16 行 = 256 字节
+const OVERSCAN = 12;
+const WHEEL_SPEED = 3;
 
 /** 检测 hidden_content 是否含有 hexdump 数据行 */
 function isHexdumpContent(text: string): boolean {
   return /^[0-9a-fA-F]+:\s+([0-9a-fA-F]{2}\s)/m.test(text);
 }
 
+/** 预计算 hidden_content 行的详情区域高度 */
+function calcDetailHeight(text: string): number {
+  const lines = text.split("\n").length;
+  return DETAIL_TOP_MARGIN + Math.min(lines, DETAIL_MAX_LINES) * DETAIL_LINE_HEIGHT + DETAIL_VERTICAL_PADDING * 2 + DETAIL_BOTTOM_GAP;
+}
+
 interface SearchResultListProps {
-  matchSeqs: number[];
+  /** 搜索结果总数 */
+  totalCount: number;
+  /** 获取指定索引的 seq（分页模式，未加载返回 undefined 并触发加载） */
+  getSeqAtIndex: (index: number) => number | undefined;
+  /** 确保指定索引范围的页已加载 */
+  ensureRange?: (startIndex: number, endIndex: number) => void;
   getMatchDetail: (seq: number) => SearchMatch | undefined;
   selectedSeq?: number | null;
   onJumpToSeq: (seq: number) => void;
@@ -41,10 +52,16 @@ interface SearchResultListProps {
   addrColorHighlight?: boolean;
   requestDetails?: (seqs: number[]) => void;
   cacheVersion?: number;
+  /** 页加载版本号，变更时触发重渲染 */
+  pageVersion?: number;
+  /** 查找 seq 在搜索结果中的索引 */
+  findSeqIndex?: (seq: number) => number;
 }
 
 export default function SearchResultList({
-  matchSeqs,
+  totalCount,
+  getSeqAtIndex,
+  ensureRange,
   getMatchDetail,
   selectedSeq: selectedSeqProp,
   onJumpToSeq,
@@ -58,6 +75,8 @@ export default function SearchResultList({
   addrColorHighlight = false,
   requestDetails,
   cacheVersion = 0,
+  pageVersion = 0,
+  findSeqIndex,
 }: SearchResultListProps) {
   const rwCol = useResizableColumn(30, "right", 20, "search:rw");
   const seqCol = useResizableColumn(90, "right", 50, "search:seq");
@@ -66,10 +85,8 @@ export default function SearchResultList({
   const beforeCol = useResizableColumn(420, "right", 40);
   const HANDLE_W = 8;
 
-  // 地址列宽度随显示模式自适应（与 TraceTable 同步）
   const [addrWidthEstimated, setAddrWidthEstimated] = useState(false);
-
-  useEffect(() => { setAddrWidthEstimated(false); }, [matchSeqs]);
+  useEffect(() => { setAddrWidthEstimated(false); }, [totalCount]);
 
   const formatAddr = useCallback((match: SearchMatch) => {
     const parts: string[] = [];
@@ -94,30 +111,120 @@ export default function SearchResultList({
   const [selectedIdx, setSelectedIdx] = useState<number | null>(null);
   const [containerHeight, setContainerHeight] = useState(0);
   const [containerWidth, setContainerWidth] = useState(0);
-  const [scrollRow, setScrollRow] = useState(0);
 
-  // 推式布局：与 TraceTable 一致，Disasm/Before 受容器宽度约束，Changes 吸收剩余
+  // ── 核心：currentRow 驱动虚拟渲染，纯数字，无浏览器限制 ──
+  const [currentRow, setCurrentRow] = useState(0);
+  const scrollPosRef = useRef(0); // 浮点精度，用于平滑滚动
+  const wheelTimerRef = useRef(0);
+
   const colFixedLeft = 40 + rwCol.width + HANDLE_W + seqCol.width + HANDLE_W + addrCol.width + HANDLE_W;
   const MIN_CHANGES_WIDTH = 60;
   const availableForRight = Math.max(0, containerWidth - colFixedLeft - 2 * HANDLE_W - MIN_CHANGES_WIDTH);
   const effectiveDisasmWidth = Math.max(200, Math.min(disasmCol.width, availableForRight - 40));
   const effectiveBeforeWidth = Math.max(40, Math.min(beforeCol.width, availableForRight - effectiveDisasmWidth));
 
+  const visibleRows = Math.max(1, Math.floor(containerHeight / BASE_ROW_HEIGHT));
+  const maxRow = Math.max(0, totalCount - visibleRows);
+
+  // currentRow 钳位
+  const clampedRow = Math.max(0, Math.min(currentRow, maxRow));
+  if (clampedRow !== currentRow) {
+    // 同步修正（避免 totalCount 缩小后超出范围）
+    scrollPosRef.current = clampedRow;
+    // 不能直接 setCurrentRow（会导致无限渲染），通过 useEffect 修正
+  }
+  useEffect(() => {
+    if (currentRow > maxRow && maxRow >= 0) {
+      scrollPosRef.current = maxRow;
+      setCurrentRow(maxRow);
+    }
+  }, [currentRow, maxRow]);
+
+  // totalCount 变化时重置滚动位置
+  useEffect(() => {
+    scrollPosRef.current = 0;
+    setCurrentRow(0);
+  }, [totalCount]);
+
+  // ── scrollTo helper（供外部跳转用）──
+  const scrollToRow = useCallback((row: number) => {
+    const clamped = Math.max(0, Math.min(row, maxRow));
+    scrollPosRef.current = clamped;
+    setCurrentRow(clamped);
+  }, [maxRow]);
+
+  // ── selectedSeq 同步 ──
   useEffect(() => {
     if (selectedSeq == null) return;
-    const idx = findSeqIndex(matchSeqs, selectedSeq);
-    if (idx >= 0) {
-      setSelectedIdx(idx);
-      virtualizer.scrollToIndex(idx, { align: "auto" });
+    if (findSeqIndex) {
+      const idx = findSeqIndex(selectedSeq);
+      if (idx >= 0) {
+        setSelectedIdx(idx);
+        scrollToRow(Math.max(0, idx - Math.floor(visibleRows / 2)));
+      }
     }
-  }, [selectedSeq, matchSeqs]);
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedSeq]);
 
-  const virtualizer = useVirtualizerNoSync({
-    count: matchSeqs.length,
-    getScrollElement: () => parentRef.current,
-    estimateSize: () => BASE_ROW_HEIGHT,
-    overscan: 12,
-  });
+  // ── wheel handler：拦截原生滚动，直接操作 currentRow ──
+  useEffect(() => {
+    const el = parentRef.current;
+    if (!el) return;
+    const handler = (e: WheelEvent) => {
+      e.preventDefault();
+      scrollPosRef.current += (e.deltaY / BASE_ROW_HEIGHT) * WHEEL_SPEED;
+      if (scrollPosRef.current < 0) scrollPosRef.current = 0;
+      if (scrollPosRef.current > maxRow) scrollPosRef.current = maxRow;
+
+      // 节流 React 状态更新
+      if (wheelTimerRef.current) clearTimeout(wheelTimerRef.current);
+      wheelTimerRef.current = window.setTimeout(() => {
+        const newRow = Math.floor(scrollPosRef.current);
+        setCurrentRow(prev => prev !== newRow ? newRow : prev);
+      }, 16);
+    };
+    el.addEventListener("wheel", handler, { passive: false });
+    return () => {
+      el.removeEventListener("wheel", handler);
+      if (wheelTimerRef.current) clearTimeout(wheelTimerRef.current);
+    };
+  }, [maxRow]);
+
+  // ── ResizeObserver ──
+  useEffect(() => {
+    const el = parentRef.current;
+    if (!el) return;
+    let timer = 0;
+    const ro = new ResizeObserver((entries) => {
+      clearTimeout(timer);
+      const { height: h, width: w } = entries[0].contentRect;
+      timer = window.setTimeout(() => {
+        setContainerHeight(h);
+        setContainerWidth(w);
+      }, document.documentElement.dataset.separatorDrag ? 300 : 0);
+    });
+    ro.observe(el);
+    return () => { clearTimeout(timer); ro.disconnect(); };
+  }, []);
+
+  // ── 手动计算可见行（替代 virtualizer.getVirtualItems）──
+  const startIdx = Math.max(0, clampedRow - OVERSCAN);
+  const endIdx = Math.min(totalCount - 1, clampedRow + visibleRows + OVERSCAN);
+
+  const virtualItems = useMemo(() => {
+    if (totalCount === 0 || containerHeight === 0) return [];
+    const items: { index: number; y: number }[] = [];
+    let y = (startIdx - clampedRow) * BASE_ROW_HEIGHT;
+    for (let i = startIdx; i <= endIdx; i++) {
+      items.push({ index: i, y });
+      // hidden_content 行需要额外高度
+      const seq = getSeqAtIndex(i);
+      const match = seq !== undefined ? getMatchDetail(seq) : undefined;
+      const h = match?.hidden_content ? BASE_ROW_HEIGHT + calcDetailHeight(match.hidden_content) : BASE_ROW_HEIGHT;
+      y += h;
+    }
+    return items;
+  }, [startIdx, endIdx, clampedRow, totalCount, containerHeight, getSeqAtIndex, getMatchDetail, pageVersion, cacheVersion]);
 
   const jumpToMatch = useCallback((match: SearchMatch, idx: number) => {
     setSelectedIdx(idx);
@@ -131,11 +238,10 @@ export default function SearchResultList({
   const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
     if (e.key !== "ArrowUp" && e.key !== "ArrowDown") return;
     e.preventDefault();
-    const len = matchSeqs.length;
-    if (len === 0) return;
+    if (totalCount === 0) return;
     const cur = selectedIdx ?? -1;
-    const next = e.key === "ArrowDown" ? Math.min(cur + 1, len - 1) : Math.max(cur - 1, 0);
-    const seq = matchSeqs[next];
+    const next = e.key === "ArrowDown" ? Math.min(cur + 1, totalCount - 1) : Math.max(cur - 1, 0);
+    const seq = getSeqAtIndex(next);
     if (seq === undefined) return;
     setSelectedIdx(next);
     const match = getMatchDetail(seq);
@@ -144,37 +250,20 @@ export default function SearchResultList({
     } else {
       onJumpToSeq(seq);
     }
-    virtualizer.scrollToIndex(next, { align: "auto" });
-  }, [matchSeqs, selectedIdx, onJumpToMatch, onJumpToSeq, virtualizer, getMatchDetail]);
+    // 保持选中行在可视区域内
+    if (next < clampedRow) scrollToRow(next);
+    else if (next >= clampedRow + visibleRows) scrollToRow(next - visibleRows + 1);
+  }, [totalCount, selectedIdx, onJumpToMatch, onJumpToSeq, getMatchDetail, getSeqAtIndex, clampedRow, visibleRows, scrollToRow]);
 
-  useEffect(() => {
-    const el = parentRef.current;
-    if (!el) return;
-    const handleScroll = () => {
-      setScrollRow(Math.floor(el.scrollTop / BASE_ROW_HEIGHT));
-    };
-    let timer = 0;
-    const ro = new ResizeObserver((entries) => {
-      clearTimeout(timer);
-      const { height: h, width: w } = entries[0].contentRect;
-      timer = window.setTimeout(() => {
-        setContainerHeight(h);
-        setContainerWidth(w);
-      }, document.documentElement.dataset.separatorDrag ? 300 : 0);
-    });
-    el.addEventListener("scroll", handleScroll);
-    handleScroll();
-    ro.observe(el);
-    return () => {
-      clearTimeout(timer);
-      el.removeEventListener("scroll", handleScroll);
-      ro.disconnect();
-    };
-  }, [matchSeqs.length]);
+  // ── Minimap / Scrollbar 回调 ──
+  const handleScrollbarScroll = useCallback((row: number) => {
+    scrollPosRef.current = row;
+    setCurrentRow(row);
+  }, []);
 
   const searchResolve = useCallback((vi: number): ResolvedRow => {
-    return { type: "line", seq: matchSeqs[vi] ?? vi } as ResolvedRow;
-  }, [matchSeqs]);
+    return { type: "line", seq: getSeqAtIndex(vi) ?? vi } as ResolvedRow;
+  }, [getSeqAtIndex, pageVersion]);
 
   const searchGetLines = useCallback(async (seqs: number[]): Promise<TraceLine[]> => {
     const seqSet = new Set(seqs);
@@ -185,7 +274,6 @@ export default function SearchResultList({
       if (match) lines.push(match as unknown as TraceLine);
       else missing.push(seq);
     }
-    // 触发 fetch 让缓存填充（Minimap 采样的 seq 大多不在缓存中）
     if (missing.length > 0 && requestDetails) {
       requestDetails(missing);
     }
@@ -198,19 +286,16 @@ export default function SearchResultList({
     return highlightText(text, searchQuery, caseSensitive ?? false, fuzzy ?? false, useRegex ?? false);
   }, [searchQuery, caseSensitive, fuzzy, useRegex]);
 
-  const visibleRows = Math.max(1, Math.ceil(containerHeight / BASE_ROW_HEIGHT));
-  const maxRow = Math.max(0, matchSeqs.length - visibleRows);
-  const virtualItems = virtualizer.getVirtualItems();
-
-  // Address column width estimation from visible rows
+  // ── 地址列宽度自适应 ──
   useEffect(() => {
     if (addrWidthEstimated) return;
-    // Estimate from visible rows that have details loaded
     const CHAR_W = 7.2;
     const PAD = 16;
     let maxLen = 0;
     for (const vi of virtualItems) {
-      const match = getMatchDetail(matchSeqs[vi.index]);
+      const seq = getSeqAtIndex(vi.index);
+      if (seq === undefined) continue;
+      const match = getMatchDetail(seq);
       if (!match) continue;
       let len = (match.so_offset || match.address || "").length;
       if (showSoName && match.so_name) len += match.so_name.length + 3;
@@ -222,19 +307,23 @@ export default function SearchResultList({
       addrCol.setWidth(estimated);
       setAddrWidthEstimated(true);
     }
-  }, [virtualItems, showSoName, showAbsAddress, addrWidthEstimated, matchSeqs, getMatchDetail]);
+  }, [virtualItems, showSoName, showAbsAddress, addrWidthEstimated, getSeqAtIndex, getMatchDetail, pageVersion]);
 
-  // Detail fetch trigger for visible rows
-  const visibleRange = useMemo(() => {
-    if (virtualItems.length === 0) return "";
-    return `${virtualItems[0].index}-${virtualItems[virtualItems.length - 1].index}`;
-  }, [virtualItems]);
+  // ── 分页加载 + 详情加载触发 ──
+  const visibleRange = useMemo(() => `${startIdx}-${endIdx}`, [startIdx, endIdx]);
 
   useEffect(() => {
-    if (!requestDetails || matchSeqs.length === 0 || virtualItems.length === 0) return;
-    const visibleSeqs = virtualItems.map(vi => matchSeqs[vi.index]).filter(s => s !== undefined);
-    requestDetails(visibleSeqs);
-  }, [visibleRange, matchSeqs, requestDetails]);
+    if (totalCount === 0) return;
+    ensureRange?.(startIdx, endIdx);
+    if (requestDetails) {
+      const visibleSeqs: number[] = [];
+      for (let i = startIdx; i <= endIdx; i++) {
+        const s = getSeqAtIndex(i);
+        if (s !== undefined) visibleSeqs.push(s);
+      }
+      if (visibleSeqs.length > 0) requestDetails(visibleSeqs);
+    }
+  }, [visibleRange, totalCount, requestDetails, pageVersion]);
 
   return (
     <>
@@ -270,178 +359,170 @@ export default function SearchResultList({
           onKeyDown={handleKeyDown}
           style={{
             flex: 1,
-            overflow: "auto",
+            overflow: "hidden",
             outline: "none",
-            scrollbarWidth: "none",
             fontSize: "var(--font-size-sm)",
+            position: "relative",
           }}
         >
-          <div style={{ height: virtualizer.getTotalSize(), width: "100%", position: "relative" }}>
-            {virtualItems.map((vRow) => {
-              const seq = matchSeqs[vRow.index];
-              const match = getMatchDetail(seq);
-              const isSelected = selectedIdx === vRow.index;
-              const baseBg = isSelected
-                ? "var(--bg-selected)"
-                : vRow.index % 2 === 0 ? "var(--bg-row-even)" : "var(--bg-row-odd)";
+          {virtualItems.map((vRow) => {
+            const seq = getSeqAtIndex(vRow.index);
+            const match = seq !== undefined ? getMatchDetail(seq) : undefined;
+            const isSelected = selectedIdx === vRow.index;
+            const baseBg = isSelected
+              ? "var(--bg-selected)"
+              : vRow.index % 2 === 0 ? "var(--bg-row-even)" : "var(--bg-row-odd)";
 
-              if (!match) {
-                return (
-                  <div
-                    key={vRow.index}
-                    ref={virtualizer.measureElement}
-                    data-index={vRow.index}
-                    onClick={() => onJumpToSeq(seq)}
-                    style={{
-                      position: "absolute", top: 0, left: 0, width: "100%",
-                      height: BASE_ROW_HEIGHT,
-                      transform: `translateY(${vRow.start}px)`,
-                      background: baseBg,
-                      display: "flex", alignItems: "center", padding: "0 8px",
-                      cursor: "pointer",
-                    }}
-                  >
-                    <span style={{ width: 40, flexShrink: 0 }} />
-                    <span style={{ color: "var(--text-disabled, #555)", fontSize: "var(--font-size-sm)" }}>
-                      #{seq + 1}
-                    </span>
-                  </div>
-                );
-              }
-
+            if (seq === undefined || !match) {
               return (
                 <div
                   key={vRow.index}
-                  ref={virtualizer.measureElement}
-                  data-index={vRow.index}
-                  onClick={() => jumpToMatch(match, vRow.index)}
+                  onClick={() => { if (seq !== undefined) onJumpToSeq(seq); }}
                   style={{
-                    position: "absolute",
-                    top: 0,
-                    left: 0,
-                    width: "100%",
-                    transform: `translateY(${vRow.start}px)`,
-                    cursor: "pointer",
-                    fontSize: "var(--font-size-sm)",
+                    position: "absolute", top: 0, left: 0, width: "100%",
+                    height: BASE_ROW_HEIGHT,
+                    transform: `translateY(${vRow.y}px)`,
                     background: baseBg,
-                    boxSizing: "border-box",
-                  }}
-                  onMouseEnter={(e) => {
-                    if (!isSelected) {
-                      e.currentTarget.style.background = "rgba(255,255,255,0.04)";
-                    }
-                  }}
-                  onMouseLeave={(e) => {
-                    if (!isSelected) {
-                      e.currentTarget.style.background = vRow.index % 2 === 0
-                        ? "var(--bg-row-even)"
-                        : "var(--bg-row-odd)";
-                    }
+                    display: "flex", alignItems: "center", padding: "0 8px",
+                    cursor: seq !== undefined ? "pointer" : "default",
                   }}
                 >
-                  <div style={{
-                    height: BASE_ROW_HEIGHT,
-                    display: "flex",
-                    alignItems: "center",
-                    padding: "0 8px",
-                  }}>
-                    <span style={{ width: 40, flexShrink: 0 }}></span>
-                    <span style={{ width: rwCol.width, flexShrink: 0, color: "var(--text-secondary)" }}>
-                      {hl(match.mem_rw === "W" || match.mem_rw === "R" ? match.mem_rw : "")}
-                    </span>
-                    <span style={{ width: HANDLE_W, flexShrink: 0 }} />
-                    <span style={{ width: seqCol.width, flexShrink: 0, color: "var(--text-secondary)" }}>{match.seq + 1}</span>
-                    <span style={{ width: HANDLE_W, flexShrink: 0 }} />
-                    <span style={{
-                      width: addrCol.width, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
-                      color: addrColorHighlight ? "var(--text-address)" : "var(--text-secondary)",
-                    }}>
-                      {addrColorHighlight && showSoName && match.so_name ? (
-                        <>
-                          <span style={{ color: "var(--text-so-name)" }}>[{match.so_name}] </span>
-                          {showAbsAddress && match.address ? (
-                            <><span style={{ color: "var(--text-abs-address)" }}>{match.address}</span>!{match.so_offset}</>
-                          ) : (match.so_offset || match.address)}
-                        </>
-                      ) : hl(formatAddr(match))}
-                    </span>
-                    <span style={{ width: HANDLE_W, flexShrink: 0 }} />
-                    <span style={{ width: effectiveDisasmWidth, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
-                      <DisasmHighlight text={match.disasm} highlightQuery={searchQuery} caseSensitive={caseSensitive} fuzzy={fuzzy} useRegex={useRegex} />
-                      {match.call_info && (
-                        <span
-                          style={{
-                            marginLeft: 8,
-                            fontStyle: "italic",
-                            color: match.call_info.is_jni ? "var(--call-info-jni)" : "var(--call-info-normal)",
-                          }}
-                          title={match.call_info.tooltip}
-                        >
-                          {hl(match.call_info.summary.length > 80
-                            ? match.call_info.summary.slice(0, 80) + "..."
-                            : match.call_info.summary)}
-                        </span>
-                      )}
-                    </span>
-                    <span style={{ width: HANDLE_W, flexShrink: 0 }} />
-                    <span
-                      style={{
-                        width: effectiveBeforeWidth, flexShrink: 0,
-                        color: "var(--text-secondary)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {hl(match.reg_before)}
-                    </span>
-                    <span style={{ width: HANDLE_W, flexShrink: 0 }} />
-                    <span
-                      style={{
-                        flex: 1,
-                        color: "var(--text-changes)",
-                        overflow: "hidden",
-                        textOverflow: "ellipsis",
-                        whiteSpace: "nowrap",
-                      }}
-                    >
-                      {hl(match.changes)}
-                    </span>
-                  </div>
-
-                  {match.hidden_content && (
-                    <div style={{
-                      padding: `${DETAIL_TOP_MARGIN}px 8px ${DETAIL_BOTTOM_GAP}px ${8 + 48 + rwCol.width + 8 + seqCol.width + 8 + addrCol.width + 8}px`,
-                    }}>
-                      <VirtualizedHighlight
-                        text={match.hidden_content}
-                        query={searchQuery ?? ""}
-                        caseSensitive={caseSensitive ?? false}
-                        fuzzy={fuzzy ?? false}
-                        useRegex={useRegex ?? false}
-                        isHex={isHexdumpContent(match.hidden_content)}
-                        lineHeight={DETAIL_LINE_HEIGHT}
-                        maxVisibleLines={DETAIL_MAX_LINES}
-                        verticalPadding={DETAIL_VERTICAL_PADDING}
-                      />
-                    </div>
-                  )}
+                  <span style={{ width: 40, flexShrink: 0 }} />
+                  <span style={{ color: "var(--text-disabled, #555)", fontSize: "var(--font-size-sm)" }}>
+                    {seq !== undefined ? `#${seq + 1}` : "Loading..."}
+                  </span>
                 </div>
               );
-            })}
-          </div>
+            }
+
+            return (
+              <div
+                key={vRow.index}
+                onClick={() => jumpToMatch(match, vRow.index)}
+                style={{
+                  position: "absolute",
+                  top: 0,
+                  left: 0,
+                  width: "100%",
+                  transform: `translateY(${vRow.y}px)`,
+                  cursor: "pointer",
+                  fontSize: "var(--font-size-sm)",
+                  background: baseBg,
+                  boxSizing: "border-box",
+                }}
+                onMouseEnter={(e) => {
+                  if (!isSelected) {
+                    e.currentTarget.style.background = "rgba(255,255,255,0.04)";
+                  }
+                }}
+                onMouseLeave={(e) => {
+                  if (!isSelected) {
+                    e.currentTarget.style.background = vRow.index % 2 === 0
+                      ? "var(--bg-row-even)"
+                      : "var(--bg-row-odd)";
+                  }
+                }}
+              >
+                <div style={{
+                  height: BASE_ROW_HEIGHT,
+                  display: "flex",
+                  alignItems: "center",
+                  padding: "0 8px",
+                }}>
+                  <span style={{ width: 40, flexShrink: 0 }}></span>
+                  <span style={{ width: rwCol.width, flexShrink: 0, color: "var(--text-secondary)" }}>
+                    {hl(match.mem_rw === "W" || match.mem_rw === "R" ? match.mem_rw : "")}
+                  </span>
+                  <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                  <span style={{ width: seqCol.width, flexShrink: 0, color: "var(--text-secondary)" }}>{match.seq + 1}</span>
+                  <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                  <span style={{
+                    width: addrCol.width, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap",
+                    color: addrColorHighlight ? "var(--text-address)" : "var(--text-secondary)",
+                  }}>
+                    {addrColorHighlight && showSoName && match.so_name ? (
+                      <>
+                        <span style={{ color: "var(--text-so-name)" }}>[{match.so_name}] </span>
+                        {showAbsAddress && match.address ? (
+                          <><span style={{ color: "var(--text-abs-address)" }}>{match.address}</span>!{match.so_offset}</>
+                        ) : (match.so_offset || match.address)}
+                      </>
+                    ) : hl(formatAddr(match))}
+                  </span>
+                  <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                  <span style={{ width: effectiveDisasmWidth, flexShrink: 0, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>
+                    <DisasmHighlight text={match.disasm} highlightQuery={searchQuery} caseSensitive={caseSensitive} fuzzy={fuzzy} useRegex={useRegex} />
+                    {match.call_info && (
+                      <span
+                        style={{
+                          marginLeft: 8,
+                          fontStyle: "italic",
+                          color: match.call_info.is_jni ? "var(--call-info-jni)" : "var(--call-info-normal)",
+                        }}
+                        title={match.call_info.tooltip}
+                      >
+                        {hl(match.call_info.summary.length > 80
+                          ? match.call_info.summary.slice(0, 80) + "..."
+                          : match.call_info.summary)}
+                      </span>
+                    )}
+                  </span>
+                  <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                  <span
+                    style={{
+                      width: effectiveBeforeWidth, flexShrink: 0,
+                      color: "var(--text-secondary)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {hl(match.reg_before)}
+                  </span>
+                  <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                  <span
+                    style={{
+                      flex: 1,
+                      color: "var(--text-changes)",
+                      overflow: "hidden",
+                      textOverflow: "ellipsis",
+                      whiteSpace: "nowrap",
+                    }}
+                  >
+                    {hl(match.changes)}
+                  </span>
+                </div>
+
+                {match.hidden_content && (
+                  <div style={{
+                    padding: `${DETAIL_TOP_MARGIN}px 8px ${DETAIL_BOTTOM_GAP}px ${8 + 48 + rwCol.width + 8 + seqCol.width + 8 + addrCol.width + 8}px`,
+                  }}>
+                    <VirtualizedHighlight
+                      text={match.hidden_content}
+                      query={searchQuery ?? ""}
+                      caseSensitive={caseSensitive ?? false}
+                      fuzzy={fuzzy ?? false}
+                      useRegex={useRegex ?? false}
+                      isHex={isHexdumpContent(match.hidden_content)}
+                      lineHeight={DETAIL_LINE_HEIGHT}
+                      maxVisibleLines={DETAIL_MAX_LINES}
+                      verticalPadding={DETAIL_VERTICAL_PADDING}
+                    />
+                  </div>
+                )}
+              </div>
+            );
+          })}
         </div>
         {containerHeight > 0 && (
           <div style={{ width: MINIMAP_WIDTH + 12, flexShrink: 0, position: "relative" }}>
             <Minimap
-              virtualTotalRows={matchSeqs.length}
+              virtualTotalRows={totalCount}
               visibleRows={visibleRows}
-              currentRow={scrollRow}
+              currentRow={clampedRow}
               maxRow={maxRow}
               height={containerHeight}
-              onScroll={(row) => {
-                virtualizer.scrollToIndex(row, { align: "start" });
-              }}
+              onScroll={handleScrollbarScroll}
               resolveVirtualIndex={searchResolve}
               getLines={searchGetLines}
               selectedSeq={selectedSeq}
@@ -450,14 +531,12 @@ export default function SearchResultList({
               showAbsAddress={showAbsAddress}
             />
             <CustomScrollbar
-              currentRow={scrollRow}
+              currentRow={clampedRow}
               maxRow={maxRow}
               visibleRows={visibleRows}
-              virtualTotalRows={matchSeqs.length}
+              virtualTotalRows={totalCount}
               trackHeight={containerHeight}
-              onScroll={(row) => {
-                virtualizer.scrollToIndex(row, { align: "start" });
-              }}
+              onScroll={handleScrollbarScroll}
             />
           </div>
         )}

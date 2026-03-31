@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::atomic::AtomicBool;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use memmap2::Mmap;
 use crate::flat::archives::{CachedStore, Phase2Archive, ScanArchive};
 use crate::flat::line_index::{LineIndexArchive, LineIndexView};
@@ -118,5 +118,7 @@ pub struct SessionHandle {
     pub(crate) build_cancel: AtomicBool,
     pub(crate) scanning_strings: AtomicBool,
     pub(crate) scan_strings_cancel: AtomicBool,
+    /// 缓存最近一次搜索的全量匹配序列号及其 generation，供分页拉取
+    pub(crate) search_cache: Mutex<(u64, Vec<u32>)>,
     pub(crate) state: RwLock<SessionState>,
 }

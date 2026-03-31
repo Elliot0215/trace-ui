@@ -78,6 +78,7 @@ impl TraceEngine {
             build_cancel: AtomicBool::new(false),
             scanning_strings: AtomicBool::new(false),
             scan_strings_cancel: AtomicBool::new(false),
+            search_cache: std::sync::Mutex::new((0, Vec::new())),
             state: RwLock::new(session_state),
         });
 
