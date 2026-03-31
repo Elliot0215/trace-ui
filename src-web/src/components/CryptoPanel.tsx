@@ -2,8 +2,11 @@ import React, { useState, useEffect, useRef, useCallback, useMemo } from "react"
 import { emit } from "@tauri-apps/api/event";
 import { useVirtualScroll } from "../hooks/useVirtualScroll";
 import { useResizableColumn } from "../hooks/useResizableColumn";
+import VirtualScrollArea from "./VirtualScrollArea";
 import ContextMenu, { ContextMenuItem } from "./ContextMenu";
-import type { CryptoMatch, CryptoScanResult } from "../types/trace";
+import Minimap, { MINIMAP_WIDTH } from "./Minimap";
+import type { CryptoMatch, CryptoScanResult, TraceLine } from "../types/trace";
+import type { ResolvedRow } from "../hooks/useFoldState";
 
 const ROW_HEIGHT = 22;
 
@@ -76,6 +79,37 @@ export default function CryptoPanel({ cryptoResults, cryptoScanning, onJumpToSeq
     setContextMenu(null);
     emit("action:view-in-memory", { addr: address, seq });
   }, [contextMenu]);
+
+  // ── Minimap callbacks ──
+  const resolveVirtualIndex = useCallback((vi: number): ResolvedRow => {
+    return { type: "line", seq: filtered[vi]?.seq ?? vi } as ResolvedRow;
+  }, [filtered]);
+
+  const getLines = useCallback(async (seqs: number[]): Promise<TraceLine[]> => {
+    const seqMap = new Map<number, CryptoMatch>();
+    for (const m of filtered) seqMap.set(m.seq, m);
+    return seqs
+      .map(seq => seqMap.get(seq))
+      .filter((m): m is CryptoMatch => m !== undefined)
+      .map(m => ({
+        seq: m.seq,
+        address: m.address,
+        so_offset: m.address,
+        so_name: null,
+        disasm: m.disasm,
+        changes: m.algorithm,
+        reg_before: "",
+        mem_rw: null,
+        mem_addr: null,
+        mem_size: null,
+        raw: "",
+        call_info: null,
+      } as TraceLine));
+  }, [filtered]);
+
+  const handleScrollbarScroll = useCallback((row: number) => {
+    vs.scrollToRow(row);
+  }, [vs]);
 
   // Reset filter when results change
   useEffect(() => {
@@ -169,10 +203,33 @@ export default function CryptoPanel({ cryptoResults, cryptoScanning, onJumpToSeq
         <span style={{ width: addrCol.width, flexShrink: 0 }}>Address</span>
         <div onMouseDown={addrCol.onMouseDown} style={HANDLE_STYLE}><div style={{ width: 1, height: "100%", background: "var(--border-color)" }} /></div>
         <span style={{ flex: 1 }}>Disasm</span>
+        <span style={{ width: MINIMAP_WIDTH + 12, flexShrink: 0 }}></span>
       </div>
 
       {/* Virtual list */}
-      <div ref={vs.containerRef} style={{ flex: 1, ...vs.containerStyle }}>
+      <VirtualScrollArea
+        containerRef={vs.containerRef}
+        containerStyle={vs.containerStyle}
+        containerHeight={vs.containerHeight}
+        scrollbarProps={vs.scrollbarProps}
+        gutterWidth={MINIMAP_WIDTH + 12}
+        gutterContent={
+          <Minimap
+            virtualTotalRows={filtered.length}
+            visibleRows={vs.visibleRows}
+            currentRow={vs.currentRow}
+            maxRow={vs.maxRow}
+            height={vs.containerHeight}
+            onScroll={handleScrollbarScroll}
+            resolveVirtualIndex={resolveVirtualIndex}
+            getLines={getLines}
+            selectedSeq={selectedSeq}
+            rightOffset={12}
+            showSoName={false}
+            showAbsAddress={false}
+          />
+        }
+      >
         {filtered.length === 0 ? (
           <div style={{ padding: 16, textAlign: "center", color: "var(--text-secondary)", fontSize: 12 }}>
             No matches for current filter
@@ -215,7 +272,7 @@ export default function CryptoPanel({ cryptoResults, cryptoScanning, onJumpToSeq
             );
           })
         )}
-      </div>
+      </VirtualScrollArea>
 
       {/* Context menu */}
       {contextMenu && (

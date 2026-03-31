@@ -4,8 +4,11 @@ import { emit, emitTo, listen } from "@tauri-apps/api/event";
 import { WebviewWindow } from "@tauri-apps/api/webviewWindow";
 import { useVirtualScroll } from "../hooks/useVirtualScroll";
 import { useResizableColumn } from "../hooks/useResizableColumn";
+import VirtualScrollArea from "./VirtualScrollArea";
+import Minimap, { MINIMAP_WIDTH } from "./Minimap";
 import ContextMenu, { ContextMenuItem } from "./ContextMenu";
-import type { StringRecordDto, StringsResult, StringXRef } from "../types/trace";
+import type { StringRecordDto, StringsResult, StringXRef, TraceLine } from "../types/trace";
+import type { ResolvedRow } from "../hooks/useFoldState";
 
 
 const PAGE_SIZE = 500;
@@ -244,6 +247,43 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
     }
   }, [contextMenu, sessionId]);
 
+  // ── Minimap 回调 ──
+  const handleScrollbarScroll = useCallback((row: number) => {
+    vs.scrollToRow(row);
+  }, [vs.scrollToRow]);
+
+  const resolveVirtualIndex = useCallback((vi: number): ResolvedRow => {
+    return { type: "line", seq: strings[vi]?.seq ?? vi } as ResolvedRow;
+  }, [strings]);
+
+  const getLines = useCallback(async (seqs: number[]): Promise<TraceLine[]> => {
+    const seqSet = new Set(seqs);
+    const lines: TraceLine[] = [];
+    for (const record of strings) {
+      if (seqSet.has(record.seq)) {
+        lines.push({
+          seq: record.seq,
+          address: record.addr,
+          so_offset: record.addr,
+          so_name: null,
+          disasm: record.content,
+          changes: record.rw,
+          reg_before: "",
+          mem_rw: record.rw,
+          mem_addr: null,
+          mem_size: null,
+          raw: "",
+          call_info: null,
+        });
+      }
+    }
+    return lines;
+  }, [strings]);
+
+  const selectedSeq = selectedIdx != null
+    ? strings.find(r => r.idx === selectedIdx)?.seq ?? null
+    : null;
+
   if (!isPhase2Ready) {
     return (
       <div style={{ flex: 1, display: "flex", alignItems: "center", justifyContent: "center" }}>
@@ -359,10 +399,33 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
         <span style={{ width: lenCol.width, flexShrink: 0 }}>Len</span>
         <div onMouseDown={xrefsCol.onMouseDown} style={HANDLE_STYLE}><div style={{ width: 1, height: "100%", background: "var(--border-color)" }} /></div>
         <span style={{ width: xrefsCol.width, flexShrink: 0 }}>XRefs</span>
+        <span style={{ width: MINIMAP_WIDTH + 12, flexShrink: 0 }}></span>
       </div>
 
       {/* 虚拟滚动列表 */}
-      <div ref={vs.containerRef} style={{ flex: 1, ...vs.containerStyle }}>
+      <VirtualScrollArea
+        containerRef={vs.containerRef}
+        containerStyle={vs.containerStyle}
+        containerHeight={vs.containerHeight}
+        scrollbarProps={vs.scrollbarProps}
+        gutterWidth={MINIMAP_WIDTH + 12}
+        gutterContent={
+          <Minimap
+            virtualTotalRows={strings.length}
+            visibleRows={vs.visibleRows}
+            currentRow={vs.currentRow}
+            maxRow={vs.maxRow}
+            height={vs.containerHeight}
+            onScroll={handleScrollbarScroll}
+            resolveVirtualIndex={resolveVirtualIndex}
+            getLines={getLines}
+            selectedSeq={selectedSeq}
+            rightOffset={12}
+            showSoName={false}
+            showAbsAddress={false}
+          />
+        }
+      >
         {Array.from({ length: Math.max(0, vs.endIdx - vs.startIdx + 1) }, (_, i) => {
           const index = vs.startIdx + i;
           const record = strings[index];
@@ -406,7 +469,7 @@ export default function StringsPanel({ sessionId, isPhase2Ready, onJumpToSeq, st
             </div>
           );
         })}
-      </div>
+      </VirtualScrollArea>
 
       {loading && (
         <div style={{
