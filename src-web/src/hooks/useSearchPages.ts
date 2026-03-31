@@ -59,7 +59,7 @@ export function useSearchPages(): UseSearchPagesReturn {
       count: PAGE_SIZE,
     }).then((result) => {
       inflightRef.current.delete(pageIndex);
-      if (localGen !== genRef.current) return; // 搜索已更新，丢弃旧结果
+      if (localGen !== genRef.current) return;
       pagesRef.current.set(pageIndex, result.seqs);
       setPageVersion(v => v + 1);
     }).catch(() => {

@@ -172,6 +172,10 @@ export default function TabPanel({
   const cache = useSearchMatchCache(sessionId, queryParams, searchGen);
   const searchPages = useSearchPages();
 
+  // 耦合两层加载：seq 页加载完成后通知 prefetch effect 重新请求
+  // 注意：不在此处请求全页详情（5000条会阻塞后端，淹没可见行请求）
+  // pageVersion 变化已自动触发 SearchResultList 的 prefetch effect
+
   // 同步外部 searchQuery 变化
   useEffect(() => { setLocalSearchQuery(searchQuery); }, [searchQuery]);
 
@@ -344,7 +348,7 @@ export default function TabPanel({
               showSoName={showSoName}
               showAbsAddress={showAbsAddress}
               addrColorHighlight={addrColorHighlight}
-              requestDetails={(seqs) => { cache.getMatches(seqs); }}
+              requestDetails={(seqs) => { cache.requestImmediate(seqs); }}
               cacheVersion={cache.cacheSize}
               pageVersion={searchPages.pageVersion}
             />

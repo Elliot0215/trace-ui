@@ -14,6 +14,8 @@ interface UseSearchMatchCacheReturn {
   getMatches: (seqs: number[]) => (SearchMatch | undefined)[];
   /** Get single cached match */
   getMatch: (seq: number) => SearchMatch | undefined;
+  /** Request details immediately without debounce (for page-load coupling) */
+  requestImmediate: (seqs: number[]) => void;
   /** Clear all cached data (call on new search) */
   clear: () => void;
   /** Number of cached entries (for triggering effects) */
@@ -96,6 +98,18 @@ export function useSearchMatchCache(
     return result;
   }, [scheduleFlush]);
 
+  /** 立即请求详情，跳过 debounce（用于 onPageLoaded 耦合） */
+  const requestImmediate = useCallback((seqs: number[]) => {
+    let hasMissing = false;
+    for (const seq of seqs) {
+      if (!cacheRef.current.has(seq) && !inflightRef.current.has(seq) && !pendingRef.current.has(seq)) {
+        pendingRef.current.add(seq);
+        hasMissing = true;
+      }
+    }
+    if (hasMissing) flush();
+  }, [flush]);
+
   const getMatch = useCallback((seq: number): SearchMatch | undefined => {
     return cacheRef.current.get(seq);
   }, []);
@@ -108,5 +122,5 @@ export function useSearchMatchCache(
     setCacheSize(0);
   }, []);
 
-  return { getMatches, getMatch, clear, cacheSize };
+  return { getMatches, getMatch, requestImmediate, clear, cacheSize };
 }

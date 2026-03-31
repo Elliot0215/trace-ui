@@ -2,6 +2,7 @@ import { useState, useMemo, useCallback, useRef } from "react";
 import { createPortal } from "react-dom";
 import { useVirtualScroll } from "../hooks/useVirtualScroll";
 import type { CallTreeNodeDto } from "../types/trace";
+import VirtualScrollArea from "./VirtualScrollArea";
 import ContextMenu, { ContextMenuItem, ContextMenuSeparator } from "./ContextMenu";
 
 interface FlatRow {
@@ -164,7 +165,12 @@ export default function FunctionTree({
       }}>
         Functions ({nodeCount.toLocaleString()})
       </div>
-      <div ref={vs.containerRef} style={{ flex: 1, ...vs.containerStyle }}>
+      <VirtualScrollArea
+        containerRef={vs.containerRef}
+        containerStyle={vs.containerStyle}
+        containerHeight={vs.containerHeight}
+        scrollbarProps={vs.scrollbarProps}
+      >
         {Array.from({ length: Math.max(0, vs.endIdx - vs.startIdx + 1) }, (_, i) => {
           const index = vs.startIdx + i;
           const row = rows[index];
@@ -217,7 +223,7 @@ export default function FunctionTree({
             </div>
           );
         })}
-      </div>
+      </VirtualScrollArea>
 
       {tooltip && createPortal(
         <div style={{

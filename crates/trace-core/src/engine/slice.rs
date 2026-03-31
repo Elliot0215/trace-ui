@@ -5,10 +5,11 @@ use crate::error::{Result, TraceError};
 use crate::flat::line_index::LineIndexView;
 use crate::flat::mem_last_def::MemLastDefView;
 use crate::query::slice::{bfs_slice, bfs_slice_with_options};
-use crate::scanner::RegLastDef;
+use crate::scanner::{RegLastDef, PAIR_HALF2_BIT, PAIR_SHARED_BIT};
 use crate::session::SliceOrigin;
 use super::TraceEngine;
 use trace_parser::types::{parse_reg, RegId, TraceFormat};
+use trace_parser::insn_class::InsnClass;
 use trace_parser::{parser, insn_class, def_use};
 use trace_parser::gumtrace as gumtrace_parser;
 
@@ -84,6 +85,22 @@ fn resolve_reg_def(
                     let cls = insn_class::classify_and_refine(&parsed);
                     let (defs, _) = def_use::determine_def_use(cls, &parsed);
                     if defs.iter().any(|r| *r == target_reg) {
+                        // For pair instructions, tag the line number with the
+                        // correct half bit so BFS follows the right dependencies.
+                        // This mirrors the logic in scanner.rs Step 4.
+                        if cls == InsnClass::LoadPair {
+                            let has_base_wb = parsed.writeback && parsed.base_reg.is_some();
+                            let data_defs = if has_base_wb { &defs[..defs.len() - 1] } else { &defs[..] };
+                            let mid = data_defs.len() / 2;
+                            if data_defs[mid..].iter().any(|r| *r == target_reg) {
+                                return Ok(s | PAIR_HALF2_BIT);
+                            }
+                            if has_base_wb && defs.last() == Some(&target_reg) {
+                                return Ok(s | PAIR_SHARED_BIT);
+                            }
+                        } else if cls == InsnClass::StorePair {
+                            return Ok(s | PAIR_SHARED_BIT);
+                        }
                         return Ok(s);
                     }
                 }

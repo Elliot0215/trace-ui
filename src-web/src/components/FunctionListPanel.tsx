@@ -2,6 +2,7 @@ import { useState, useEffect, useMemo, useRef, useCallback } from "react";
 import { invoke } from "@tauri-apps/api/core";
 import { useVirtualScroll } from "../hooks/useVirtualScroll";
 import type { FunctionCallEntry, FunctionCallsResult } from "../types/trace";
+import VirtualScrollArea from "./VirtualScrollArea";
 import ContextMenu, { ContextMenuItem } from "./ContextMenu";
 
 type FilterType = "all" | "syscall" | "jni";
@@ -277,7 +278,12 @@ export default function FunctionListPanel({ sessionId, isPhase2Ready, onJumpToSe
       </div>
 
       {/* Virtual list */}
-      <div ref={vs.containerRef} style={{ flex: 1, ...vs.containerStyle }}>
+      <VirtualScrollArea
+        containerRef={vs.containerRef}
+        containerStyle={vs.containerStyle}
+        containerHeight={vs.containerHeight}
+        scrollbarProps={vs.scrollbarProps}
+      >
         {Array.from({ length: Math.max(0, vs.endIdx - vs.startIdx + 1) }, (_, i) => {
           const index = vs.startIdx + i;
           const row = rows[index];
@@ -367,7 +373,7 @@ export default function FunctionListPanel({ sessionId, isPhase2Ready, onJumpToSe
             );
           }
         })}
-      </div>
+      </VirtualScrollArea>
 
       {ctxMenu && (
         <ContextMenu x={ctxMenu.x} y={ctxMenu.y} onClose={() => setCtxMenu(null)}>

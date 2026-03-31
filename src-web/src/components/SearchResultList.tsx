@@ -327,9 +327,19 @@ export default function SearchResultList({
                   }}
                 >
                   <span style={{ width: 40, flexShrink: 0 }} />
-                  <span style={{ color: "var(--text-disabled, #555)", fontSize: "var(--font-size-sm)" }}>
-                    {seq !== undefined ? `#${seq + 1}` : "Loading..."}
-                  </span>
+                  {seq !== undefined ? (
+                    <>
+                      <span style={{ width: rwCol.width, flexShrink: 0 }}><span style={{ display: "inline-block", width: 10, height: 8, borderRadius: 2, background: "var(--border-color)", opacity: 0.4 }} /></span>
+                      <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                      <span style={{ width: seqCol.width, flexShrink: 0, color: "var(--text-secondary)", fontSize: "var(--font-size-sm)" }}>{seq + 1}</span>
+                      <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                      <span style={{ width: addrCol.width, flexShrink: 0 }}><span style={{ display: "inline-block", width: "60%", height: 8, borderRadius: 2, background: "var(--border-color)", opacity: 0.3 }} /></span>
+                      <span style={{ width: HANDLE_W, flexShrink: 0 }} />
+                      <span style={{ width: effectiveDisasmWidth, flexShrink: 0 }}><span style={{ display: "inline-block", width: "70%", height: 8, borderRadius: 2, background: "var(--border-color)", opacity: 0.3 }} /></span>
+                    </>
+                  ) : (
+                    <span style={{ color: "var(--text-disabled, #555)", fontSize: "var(--font-size-sm)" }}>Loading...</span>
+                  )}
                 </div>
               );
             }
