@@ -808,7 +808,8 @@ pub fn merge_all_chunks(
                 }
             }
             if max_addr > min_addr {
-                ((max_addr - min_addr) / 4096 + 1) as usize
+                // 上限 1M 页（~4GB 地址范围），避免稀疏地址空间导致 OOM
+                (((max_addr - min_addr) / 4096 + 1) as usize).min(1_000_000)
             } else {
                 1024
             }
